@@ -1,0 +1,11 @@
+/home/admin-vb/sgx-aead-agent/build/CMakeFiles/edit_cache.dir
+/home/admin-vb/sgx-aead-agent/build/CMakeFiles/rebuild_cache.dir
+/home/admin-vb/sgx-aead-agent/build/enclave/CMakeFiles/Enclave_obj.dir
+/home/admin-vb/sgx-aead-agent/build/enclave/CMakeFiles/Enclave.dir
+/home/admin-vb/sgx-aead-agent/build/enclave/CMakeFiles/Enclave_signed.dir
+/home/admin-vb/sgx-aead-agent/build/enclave/CMakeFiles/edit_cache.dir
+/home/admin-vb/sgx-aead-agent/build/enclave/CMakeFiles/rebuild_cache.dir
+/home/admin-vb/sgx-aead-agent/build/host/CMakeFiles/edger8r_untrusted.dir
+/home/admin-vb/sgx-aead-agent/build/host/CMakeFiles/sgx-agent.dir
+/home/admin-vb/sgx-aead-agent/build/host/CMakeFiles/edit_cache.dir
+/home/admin-vb/sgx-aead-agent/build/host/CMakeFiles/rebuild_cache.dir

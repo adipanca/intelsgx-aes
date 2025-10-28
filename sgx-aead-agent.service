@@ -1,0 +1,19 @@
+# /etc/systemd/system/sgx-aead-agent.service
+[Unit]
+Description=SGX AEAD Agent (SIM)
+After=network.target
+
+[Service]
+User=admin-vb
+Group=admin-vb
+Environment=KMS_SOCK_PATH=/run/aead-kms/aead-kms.sock
+ExecStartPre=/usr/bin/mkdir -p /run/aead-kms
+ExecStartPre=/usr/bin/chgrp 999 /run/aead-kms
+ExecStartPre=/usr/bin/chmod 770 /run/aead-kms
+ExecStart=/home/admin-vb/sgx-aead-agent/build/host/sgx-agent /home/admin-vb/sgx-aead-agent/build/host/Enclave.signed.so
+ExecStartPost=/usr/bin/chgrp 999 /run/aead-kms/aead-kms.sock
+ExecStartPost=/usr/bin/chmod 660 /run/aead-kms/aead-kms.sock
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

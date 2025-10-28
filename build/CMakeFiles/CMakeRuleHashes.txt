@@ -1,0 +1,7 @@
+# Hashes of file build rules.
+5dd0ddff010ebd5bc0e64f8eadf461aa enclave/CMakeFiles/Enclave_signed
+e6dd589432041c991b6ed8f938cdc833 enclave/Enclave.signed.so
+14617c59052191c1275105b06dfcef5c enclave/Enclave_private.pem
+2edddb7defec78c1ff2e8f9c48935a22 enclave/edger8r/Enclave_t.c
+79e661fd5b9807dd519e2df283c7e958 host/CMakeFiles/edger8r_untrusted
+cbeace00c7bd804322b8305a83b93a34 host/edger8r/Enclave_u.c

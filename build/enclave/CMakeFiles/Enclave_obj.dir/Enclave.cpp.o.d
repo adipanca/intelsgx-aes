@@ -1,0 +1,24 @@
+enclave/CMakeFiles/Enclave_obj.dir/Enclave.cpp.o: \
+ /home/admin-vb/sgx-aead-agent/enclave/Enclave.cpp \
+ /usr/include/stdc-predef.h \
+ /home/admin-vb/sgx-aead-agent/build/enclave/edger8r/Enclave_t.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/stdint.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/sys/stdint.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/sys/cdefs.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/sys/_types.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/wchar.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/stddef.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_edger8r.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_defs.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_error.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_eid.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/stdlib.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_trts.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_tcrypto.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_attributes.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_key.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_report.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/tlibc/string.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_tseal.h \
+ /home/admin-vb/opt/intel/sgxsdk/include/sgx_tcrypto.h

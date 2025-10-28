@@ -1,0 +1,41 @@
+enclave {
+    from "sgx_tstdc.edl" import *;
+
+    trusted {
+        public void e_init();
+
+        public int e_encrypt(
+            [in,  size=len_p]  uint8_t* p,   size_t len_p,
+            [in,  size=len_a]  uint8_t* aad, size_t len_a,
+            [out, size=len_out] uint8_t* out, size_t len_out,
+            [out] size_t* written
+        );
+
+        public int e_decrypt(
+            [in,  size=len_b]  uint8_t* blob, size_t len_b,
+            [in,  size=len_a]  uint8_t* aad,  size_t len_a,
+            [out, size=len_out] uint8_t* out, size_t len_out,
+            [out] size_t* written
+        );
+
+        public int e_hmac_sha256_kid(
+            uint32_t kid,
+            [in,  size=data_len] uint8_t* data,  size_t data_len,
+            [out, size=32]       uint8_t* mac32
+        );
+        
+        public int e_hmac_sha256(
+            [in,  size=key_len]  uint8_t* key,  size_t key_len,
+            [in,  size=data_len] uint8_t* data, size_t data_len,
+            [out, size=32]       uint8_t* mac32
+        );
+    };
+
+    untrusted {
+        int u_read_file([in, string] const char* path,
+                        [out, size=maxlen] uint8_t* buf, size_t maxlen,
+                        [out] size_t* outlen);
+        int u_write_file([in, string] const char* path,
+                         [in, size=len] uint8_t* buf, size_t len);
+    };
+};
