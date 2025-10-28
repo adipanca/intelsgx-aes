@@ -1,0 +1,722 @@
+(* Event for record sent and receive message *)
+event sendMsg(m: bitstring).
+event recvMsg(m: bitstring).
+
+process
+  (* forexamle Client *)
+  out(c, m);
+  event sendMsg(m);
+  ...
+
+  (* forexamle Server *)
+  in(c, m);
+  event recvMsg(m);
+  ...
+
+
+EX) 
+inj-event(sendMsg(m)) ==> inj-event(recvMsgsendMsg(m))
+&&
+attacker(m)
+
+
+SHOW COLUMNS FROM AuthenticationSubscription;
+-- SHOW COLUMNS FROM AccessAndMobilitySubscriptionData;
+SHOW COLUMNS FROM SessionManagementSubscriptionData;
+-- SHOW COLUMNS FROM SmfSelectionSubscriptionData;
+
+
+
+-- A. Authentication
+INSERT INTO AuthenticationSubscription
+(ueid, authenticationMethod, encPermanentKey, protectionParameterId,
+ sequenceNumber, authenticationManagementField, algorithmId,
+ encOpcKey, encTopcKey, vectorGenerationInHss, n5gcAuthMethod, rgAuthenticationInd, supi)
+VALUES
+('imsi-001010123456789', '5G_AKA', '465B5CE8B199B49FAA5F0A2EE238A6BC', '1',
+ JSON_OBJECT('sqn','000000000000'), '8000', 'milenage',
+ 'E8ED289DEBA952E4283B54E88E6183CA', NULL, 0, '5G_AKA', 0, 'imsi-001010123456789');
+
+-- B. Access & Mobility (PLMN/NSSAI)
+INSERT INTO AccessAndMobilitySubscriptionData
+(ueid, servingPlmnid, subscribedUeAmbr, nssai,
+ mpsPriority, mcsPriority, iabOperationAllowed)
+VALUES
+('imsi-001010123456789', '00101',
+ JSON_OBJECT('uplink','2 Gbps','downlink','2 Gbps'),
+ JSON_OBJECT('singleNssais', JSON_ARRAY(JSON_OBJECT('sst',1,'sd','000001'))),
+ 0, 0, 0);
+
+-- C. SMF selection
+INSERT INTO SmfSelectionSubscriptionData
+(ueid, servingPlmnid, subscribedSnssaiInfos)
+VALUES
+('imsi-001010123456789', '00101',
+ JSON_OBJECT('00101', JSON_OBJECT('singleNssais', JSON_ARRAY(JSON_OBJECT('sst',1,'sd','000001')))));
+
+-- D. Session Mgmt (DNN / PDU type / AMBR)
+INSERT INTO SessionManagementSubscriptionData
+(ueid, servingPlmnid, singleNssai, dnnConfigurations)
+VALUES
+('imsi-001010123456789', '00101',
+ JSON_OBJECT('sst',1,'sd','000001'),
+ JSON_OBJECT(
+   'internet', JSON_OBJECT(
+     'sscModes', JSON_OBJECT('defaultSscMode','SSC_MODE_1'),
+     'pduSessionTypes', JSON_OBJECT('defaultSessionType','IPV4'),
+     'sessionAmbr', JSON_OBJECT('uplink','2 Gbps','downlink','2 Gbps')
+   )
+ ));
+
+
+
+
+
+
+
+
+
+
+
+
+
+USE oai_db;
+
+ALTER TABLE AuthenticationSubscription
+  ADD COLUMN supi_ct    VARBINARY(128) NULL AFTER supi,
+  ADD COLUMN supi_nonce BINARY(12)     NULL AFTER supi_ct,
+  ADD COLUMN supi_tag   BINARY(16)     NULL AFTER supi_nonce,
+  ADD COLUMN supi_kid   INT            NULL AFTER supi_tag,
+  ADD COLUMN supi_tok   BINARY(32)     NULL AFTER supi_kid;
+
+-- (Opsional tapi disarankan) cegah pengisian plaintext langsung lewat constraint/privileges;
+-- plaintext 'supi' akan dikosongkan oleh trigger.
+
+
+
+
+
+
+-- OPTIONAL (butuh privilege SUPER, kalau tidak ya lewati baris ini)
+-- SET GLOBAL log_bin_trust_function_creators = 1;
+
+USE oai_db;
+
+DELIMITER $$
+
+-- ======================
+-- AAD helper
+-- ======================
+DROP FUNCTION IF EXISTS authsub_aad $$
+CREATE FUNCTION authsub_aad(p_ueid VARCHAR(20))
+RETURNS VARBINARY(255)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+RETURN CONCAT(CAST('table=AuthenticationSubscription;ueid=' AS BINARY), p_ueid) $$
+
+-- ======================
+-- AEAD encrypt wrapper
+-- output: ct, nonce(12), tag(16)
+-- AEAD_ENCRYPT_DEFAULT mengembalikan blob: nonce||ct||tag
+-- ======================
+DROP PROCEDURE IF EXISTS authsub_encrypt $$
+CREATE PROCEDURE authsub_encrypt(
+    IN  p_plain VARBINARY(64),
+    IN  p_ueid  VARCHAR(20),
+    IN  p_kid   INT,
+    OUT p_ct    VARBINARY(128),
+    OUT p_nonce BINARY(12),
+    OUT p_tag   BINARY(16)
+)
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_aad  VARBINARY(255);
+  DECLARE v_blob VARBINARY(2048);
+  DECLARE v_len  INT;
+
+  SET v_aad := authsub_aad(p_ueid);
+  SET v_blob := AEAD_ENCRYPT_DEFAULT(p_plain, v_aad, p_kid);
+  SET v_len  := OCTET_LENGTH(v_blob);
+
+  -- blob = nonce(12) || ct(..) || tag(16)
+  SET p_nonce := SUBSTRING(v_blob, 1, 12);
+  SET p_tag   := SUBSTRING(v_blob, v_len - 16 + 1, 16);
+  SET p_ct    := SUBSTRING(v_blob, 13, v_len - 12 - 16);
+END $$
+
+-- ======================
+-- AEAD decrypt wrapper
+-- input: ct, nonce, tag  -> gabung jadi blob dan decrypt
+-- ======================
+DROP FUNCTION IF EXISTS authsub_decrypt $$
+CREATE FUNCTION authsub_decrypt(
+    p_ct    VARBINARY(128),
+    p_nonce BINARY(12),
+    p_tag   BINARY(16),
+    p_ueid  VARCHAR(20),
+    p_kid   INT
+)
+RETURNS VARBINARY(64)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_aad  VARBINARY(255);
+  DECLARE v_blob VARBINARY(2048);
+
+  SET v_aad  := authsub_aad(p_ueid);
+  SET v_blob := CONCAT(p_nonce, p_ct, p_tag);
+  RETURN AEAD_DECRYPT_DEFAULT(v_blob, v_aad, p_kid);
+END $$
+
+-- ======================
+-- Deterministic token untuk pencarian equality
+-- (HMAC, bukan hash raw)
+-- ======================
+DROP FUNCTION IF EXISTS authsub_token $$
+CREATE FUNCTION authsub_token(p_plain VARBINARY(64), p_kid INT)
+RETURNS BINARY(32)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+RETURN HMAC_SHA256_DEFAULT(p_plain, p_kid) $$
+
+DELIMITER ;
+
+
+DELIMITER $$
+
+CREATE TRIGGER authsub_enc_bi
+BEFORE INSERT ON AuthenticationSubscription
+FOR EACH ROW
+BEGIN
+  DECLARE v_ct VARBINARY(128);
+  DECLARE v_nonce BINARY(12);
+  DECLARE v_tag BINARY(16);
+  DECLARE v_kid INT DEFAULT 1;
+
+  IF NEW.supi IS NOT NULL AND CHAR_LENGTH(NEW.supi) > 0 THEN
+    CALL authsub_encrypt(NEW.supi, NEW.ueid, v_kid, v_ct, v_nonce, v_tag);
+    SET NEW.supi_ct    = v_ct;
+    SET NEW.supi_nonce = v_nonce;
+    SET NEW.supi_tag   = v_tag;
+    SET NEW.supi_kid   = v_kid;
+    SET NEW.supi_tok   = authsub_token(NEW.supi, v_kid);  -- untuk WHERE equality
+    SET NEW.supi       = NULL;                             -- buang plaintext
+  END IF;
+END$$
+
+CREATE TRIGGER authsub_enc_bu
+BEFORE UPDATE ON AuthenticationSubscription
+FOR EACH ROW
+BEGIN
+  DECLARE v_ct VARBINARY(128);
+  DECLARE v_nonce BINARY(12);
+  DECLARE v_tag BINARY(16);
+  DECLARE v_kid INT;
+
+  -- jika kid belum ada, pakai default 1
+  SET v_kid = IFNULL(NEW.supi_kid, 1);
+
+  IF NEW.supi IS NOT NULL AND NEW.supi <> '' THEN
+    CALL authsub_encrypt(NEW.supi, NEW.ueid, v_kid, v_ct, v_nonce, v_tag);
+    SET NEW.supi_ct    = v_ct;
+    SET NEW.supi_nonce = v_nonce;
+    SET NEW.supi_tag   = v_tag;
+    SET NEW.supi_kid   = v_kid;
+    SET NEW.supi_tok   = authsub_token(NEW.supi, v_kid);
+    SET NEW.supi       = NULL;
+  END IF;
+
+  -- Jika ueid berubah (jarang), re-encrypt karena AAD bergantung ueid
+  IF NEW.ueid <> OLD.ueid AND NEW.supi_ct IS NOT NULL THEN
+    -- decrypt lama lalu encrypt ulang dengan AAD baru
+    SET @plain := authsub_decrypt(OLD.supi_ct, OLD.supi_nonce, OLD.supi_tag, OLD.ueid, OLD.supi_kid);
+    CALL authsub_encrypt(@plain, NEW.ueid, v_kid, v_ct, v_nonce, v_tag);
+    SET NEW.supi_ct    = v_ct;
+    SET NEW.supi_nonce = v_nonce;
+    SET NEW.supi_tag   = v_tag;
+    SET NEW.supi_kid   = v_kid;
+    SET NEW.supi_tok   = authsub_token(@plain, v_kid);
+  END IF;
+END$$
+
+DELIMITER ;
+
+
+CREATE OR REPLACE VIEW v_AuthenticationSubscription AS
+SELECT
+  ueid,
+  authenticationMethod,
+  encPermanentKey,
+  protectionParameterId,
+  sequenceNumber,
+  authenticationManagementField,
+  algorithmId,
+  encOpcKey,
+  encTopcKey,
+  vectorGenerationInHss,
+  n5gcAuthMethod,
+  rgAuthenticationInd,
+  /* kembalikan SUPI terdekripsi; NULL jika komponen AEAD belum ada */
+  CASE
+    WHEN supi_ct IS NOT NULL AND supi_nonce IS NOT NULL AND supi_tag IS NOT NULL AND supi_kid IS NOT NULL
+    THEN CAST(authsub_decrypt(supi_ct, supi_nonce, supi_tag, ueid, supi_kid) AS CHAR)
+    ELSE NULL
+  END AS supi
+FROM AuthenticationSubscription;
+
+
+
+
+USE oai_db;
+DELIMITER $$
+
+-- ===== Stub AEAD_ENCRYPT_DEFAULT =====
+-- Return format: nonce(12B) || "ciphertext"(=plaintext) || tag(16B pseudo)
+DROP FUNCTION IF EXISTS AEAD_ENCRYPT_DEFAULT $$
+CREATE FUNCTION AEAD_ENCRYPT_DEFAULT(
+  p_plain VARBINARY(64),
+  p_aad   VARBINARY(255),
+  p_kid   INT
+) RETURNS VARBINARY(2048)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_nonce BINARY(12);
+  DECLARE v_tag   BINARY(16);
+  -- nonce acak (12B)
+  SET v_nonce := RANDOM_BYTES(12);
+  -- "tag" palsu: 16B dari SHA2(nonce || plain || aad || kid)
+  SET v_tag := UNHEX(SUBSTRING(SHA2(CONCAT(v_nonce, p_plain, p_aad, p_kid), 256), 1, 32));
+  -- ciphertext = plaintext (TIDAK dienkripsi)
+  RETURN CONCAT(v_nonce, p_plain, v_tag);
+END $$
+
+-- ===== Stub AEAD_DECRYPT_DEFAULT =====
+-- Ambil kembali bagian tengah (plaintext) dari blob nonce||ct||tag
+DROP FUNCTION IF EXISTS AEAD_DECRYPT_DEFAULT $$
+CREATE FUNCTION AEAD_DECRYPT_DEFAULT(
+  p_blob VARBINARY(2048),
+  p_aad  VARBINARY(255),
+  p_kid  INT
+) RETURNS VARBINARY(64)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_len INT;
+  SET v_len := OCTET_LENGTH(p_blob);
+  -- plaintext = SUBSTRING mulai byte ke-13 sepanjang v_len-28 (potong 12B nonce & 16B tag)
+  RETURN SUBSTRING(p_blob, 13, v_len - 12 - 16);
+END $$
+
+-- ===== Stub HMAC_SHA256_DEFAULT =====
+-- Token deterministik 32B untuk pencarian equality
+DROP FUNCTION IF EXISTS HMAC_SHA256_DEFAULT $$
+CREATE FUNCTION HMAC_SHA256_DEFAULT(
+  p_plain VARBINARY(64),
+  p_kid   INT
+) RETURNS BINARY(32)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+BEGIN
+  -- pseudo-HMAC: gunakan SHA2("kid=<kid>:" || plain) → 32B
+  RETURN UNHEX(SHA2(CONCAT('kid=', p_kid, ':', p_plain), 256));
+END $$
+
+DELIMITER ;
+
+
+
+INSERT INTO AuthenticationSubscription
+(ueid, authenticationMethod, encPermanentKey, protectionParameterId,
+ sequenceNumber, authenticationManagementField, algorithmId,
+ encOpcKey, vectorGenerationInHss, n5gcAuthMethod, supi)
+VALUES
+('001010000000009', '5G_AKA', '465B5CE8B199B49FAA5F0A2EE238A6BC', '1',
+ JSON_OBJECT('sqn','000000000000'), '8000', 'milenage',
+ 'E8ED289DEBA952E4283B54E88E6183CA', 0, '5G_AKA', '001010000000009');
+
+
+SELECT ueid, supi FROM v_AuthenticationSubscription
+WHERE ueid = '001010000000009';
+
+SELECT ueid, HEX(supi_nonce), OCTET_LENGTH(supi_ct) AS ct_len, HEX(supi_tag)
+FROM AuthenticationSubscription
+WHERE ueid = '001010000000009';
+
+
+-- =========================================================================================================
+
+Kompilasi shared object UDF (mis. libaead_udf.so) dan taruh di plugin_dir.
+Compile jadi aead_udf.so dan taruh di folder plugin MySQL
+
+SELECT @@plugin_dir;
+
+CREATE FUNCTION AEAD_ENCRYPT_DEFAULT RETURNS STRING SONAME 'libaead_udf.so';
+CREATE FUNCTION AEAD_DECRYPT_DEFAULT RETURNS STRING SONAME 'libaead_udf.so';
+CREATE FUNCTION HMAC_SHA256_DEFAULT  RETURNS STRING SONAME 'libaead_udf.so';
+
+
+USE oai_db;
+
+ALTER TABLE AuthenticationSubscription
+  ADD COLUMN supi_ct    VARBINARY(128) NULL AFTER supi,
+  ADD COLUMN supi_nonce BINARY(12)     NULL AFTER supi_ct,
+  ADD COLUMN supi_tag   BINARY(16)     NULL AFTER supi_nonce,
+  ADD COLUMN supi_kid   INT            NULL AFTER supi_tag,
+  ADD COLUMN supi_tok   BINARY(32)     NULL AFTER supi_kid;
+
+
+USE oai_db;
+
+DELIMITER $$
+
+-- 1) Helper AAD
+DROP FUNCTION IF EXISTS authsub_aad $$
+CREATE FUNCTION authsub_aad(p_ueid VARCHAR(20))
+RETURNS VARBINARY(255)
+DETERMINISTIC NO SQL SQL SECURITY INVOKER
+RETURN CONCAT(CAST('table=AuthenticationSubscription;ueid=' AS BINARY), p_ueid) $$
+
+-- 2) Wrapper ENCRYPT (panggil UDF AEAD)
+DROP PROCEDURE IF EXISTS authsub_encrypt $$
+CREATE PROCEDURE authsub_encrypt(
+    IN  p_plain VARBINARY(64),
+    IN  p_ueid  VARCHAR(20),
+    IN  p_kid   INT,
+    OUT p_ct    VARBINARY(128),
+    OUT p_nonce BINARY(12),
+    OUT p_tag   BINARY(16)
+)
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_aad  VARBINARY(255);
+  DECLARE v_blob VARBINARY(2048);
+  DECLARE v_len  INT;
+
+  SET v_aad  := authsub_aad(p_ueid);
+  SET v_blob := AEAD_ENCRYPT_DEFAULT(p_plain, v_aad, p_kid);
+  SET v_len  := OCTET_LENGTH(v_blob);
+
+  SET p_nonce := SUBSTRING(v_blob, 1, 12);
+  SET p_tag   := SUBSTRING(v_blob, v_len-16+1, 16);
+  SET p_ct    := SUBSTRING(v_blob, 13, v_len-12-16);
+END $$
+
+-- 3) Wrapper DECRYPT (gabung nonce||ct||tag → UDF)
+DROP FUNCTION IF EXISTS authsub_decrypt $$
+CREATE FUNCTION authsub_decrypt(
+    p_ct    VARBINARY(128),
+    p_nonce BINARY(12),
+    p_tag   BINARY(16),
+    p_ueid  VARCHAR(20),
+    p_kid   INT
+)
+RETURNS VARBINARY(64)
+DETERMINISTIC NO SQL SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_aad  VARBINARY(255);
+  DECLARE v_blob VARBINARY(2048);
+  SET v_aad  := authsub_aad(p_ueid);
+  SET v_blob := CONCAT(p_nonce, p_ct, p_tag);
+  RETURN AEAD_DECRYPT_DEFAULT(v_blob, v_aad, p_kid);
+END $$
+
+-- 4) Token deterministik untuk pencarian equality
+DROP FUNCTION IF EXISTS authsub_token $$
+CREATE FUNCTION authsub_token(p_plain VARBINARY(64), p_kid INT)
+RETURNS BINARY(32)
+DETERMINISTIC NO SQL SQL SECURITY INVOKER
+RETURN HMAC_SHA256_DEFAULT(p_plain, p_kid) $$
+
+-- 5) Trigger BEFORE INSERT/UPDATE
+DROP TRIGGER IF EXISTS authsub_enc_bi $$
+CREATE TRIGGER authsub_enc_bi
+BEFORE INSERT ON AuthenticationSubscription
+FOR EACH ROW
+BEGIN
+  DECLARE v_ct VARBINARY(128);
+  DECLARE v_nonce BINARY(12);
+  DECLARE v_tag BINARY(16);
+  DECLARE v_kid INT DEFAULT 1;
+
+  IF NEW.supi IS NOT NULL AND CHAR_LENGTH(NEW.supi) > 0 THEN
+    CALL authsub_encrypt(NEW.supi, NEW.ueid, v_kid, v_ct, v_nonce, v_tag);
+    SET NEW.supi_ct    = v_ct;
+    SET NEW.supi_nonce = v_nonce;
+    SET NEW.supi_tag   = v_tag;
+    SET NEW.supi_kid   = v_kid;
+    SET NEW.supi_tok   = authsub_token(NEW.supi, v_kid);
+    SET NEW.supi       = NULL;
+  END IF;
+END $$
+
+DROP TRIGGER IF EXISTS authsub_enc_bu $$
+CREATE TRIGGER authsub_enc_bu
+BEFORE UPDATE ON AuthenticationSubscription
+FOR EACH ROW
+BEGIN
+  DECLARE v_ct VARBINARY(128);
+  DECLARE v_nonce BINARY(12);
+  DECLARE v_tag BINARY(16);
+  DECLARE v_kid INT;
+
+  SET v_kid = IFNULL(NEW.supi_kid, 1);
+
+  -- re-encrypt jika SUPI diisi (plaintext)
+  IF NEW.supi IS NOT NULL AND NEW.supi <> '' THEN
+    CALL authsub_encrypt(NEW.supi, NEW.ueid, v_kid, v_ct, v_nonce, v_tag);
+    SET NEW.supi_ct    = v_ct;
+    SET NEW.supi_nonce = v_nonce;
+    SET NEW.supi_tag   = v_tag;
+    SET NEW.supi_kid   = v_kid;
+    SET NEW.supi_tok   = authsub_token(NEW.supi, v_kid);
+    SET NEW.supi       = NULL;
+  END IF;
+
+  -- jika ueid berubah, re-encrypt karena AAD terkait ueid
+  IF NEW.ueid <> OLD.ueid AND OLD.supi_ct IS NOT NULL THEN
+    SET @plain := authsub_decrypt(OLD.supi_ct, OLD.supi_nonce, OLD.supi_tag, OLD.ueid, OLD.supi_kid);
+    CALL authsub_encrypt(@plain, NEW.ueid, v_kid, v_ct, v_nonce, v_tag);
+    SET NEW.supi_ct    = v_ct;
+    SET NEW.supi_nonce = v_nonce;
+    SET NEW.supi_tag   = v_tag;
+    SET NEW.supi_kid   = v_kid;
+    SET NEW.supi_tok   = authsub_token(@plain, v_kid);
+  END IF;
+END $$
+
+DELIMITER ;
+
+-- 6) VIEW untuk baca SUPI terdekripsi
+CREATE OR REPLACE VIEW v_AuthenticationSubscription AS
+SELECT
+  ueid,
+  authenticationMethod,
+  encPermanentKey,
+  protectionParameterId,
+  sequenceNumber,
+  authenticationManagementField,
+  algorithmId,
+  encOpcKey,
+  encTopcKey,
+  vectorGenerationInHss,
+  n5gcAuthMethod,
+  rgAuthenticationInd,
+  CASE
+    WHEN supi_ct IS NOT NULL AND supi_nonce IS NOT NULL AND supi_tag IS NOT NULL AND supi_kid IS NOT NULL
+    THEN authsub_decrypt(supi_ct, supi_nonce, supi_tag, ueid, supi_kid)
+    ELSE NULL
+  END AS supi
+FROM AuthenticationSubscription;
+
+
+
+
+USE oai_db;
+DELIMITER $$
+
+-- ===== Stub AEAD_ENCRYPT_DEFAULT =====
+-- Return format: nonce(12B) || "ciphertext"(=plaintext) || tag(16B pseudo)
+DROP FUNCTION IF EXISTS AEAD_ENCRYPT_DEFAULT $$
+CREATE FUNCTION AEAD_ENCRYPT_DEFAULT(
+  p_plain VARBINARY(64),
+  p_aad   VARBINARY(255),
+  p_kid   INT
+) RETURNS VARBINARY(2048)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_nonce BINARY(12);
+  DECLARE v_tag   BINARY(16);
+  -- nonce acak (12B)
+  SET v_nonce := RANDOM_BYTES(12);
+  -- "tag" palsu: 16B dari SHA2(nonce || plain || aad || kid)
+  SET v_tag := UNHEX(SUBSTRING(SHA2(CONCAT(v_nonce, p_plain, p_aad, p_kid), 256), 1, 32));
+  -- ciphertext = plaintext (TIDAK dienkripsi)
+  RETURN CONCAT(v_nonce, p_plain, v_tag);
+END $$
+
+-- ===== Stub AEAD_DECRYPT_DEFAULT =====
+-- Ambil kembali bagian tengah (plaintext) dari blob nonce||ct||tag
+DROP FUNCTION IF EXISTS AEAD_DECRYPT_DEFAULT $$
+CREATE FUNCTION AEAD_DECRYPT_DEFAULT(
+  p_blob VARBINARY(2048),
+  p_aad  VARBINARY(255),
+  p_kid  INT
+) RETURNS VARBINARY(64)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE v_len INT;
+  SET v_len := OCTET_LENGTH(p_blob);
+  -- plaintext = SUBSTRING mulai byte ke-13 sepanjang v_len-28 (potong 12B nonce & 16B tag)
+  RETURN SUBSTRING(p_blob, 13, v_len - 12 - 16);
+END $$
+
+-- ===== Stub HMAC_SHA256_DEFAULT =====
+-- Token deterministik 32B untuk pencarian equality
+DROP FUNCTION IF EXISTS HMAC_SHA256_DEFAULT $$
+CREATE FUNCTION HMAC_SHA256_DEFAULT(
+  p_plain VARBINARY(64),
+  p_kid   INT
+) RETURNS BINARY(32)
+DETERMINISTIC
+NO SQL
+SQL SECURITY INVOKER
+BEGIN
+  -- pseudo-HMAC: gunakan SHA2("kid=<kid>:" || plain) → 32B
+  RETURN UNHEX(SHA2(CONCAT('kid=', p_kid, ':', p_plain), 256));
+END $$
+
+DELIMITER ;
+
+
+
+
+
+gcc -Wall -Wextra -fPIC -O2 -I/usr/include/mysql ~/aead_udf.c -shared -o ~/aead.so \
+  $(mysql_config --libs) -lssl -lcrypto
+
+
+# salin ke plugin dir
+docker cp ~/aead.so mysql:/usr/lib64/mysql/plugin/aead.so
+
+# drop & recreate supaya MySQL reload .so terbaru
+docker exec -it mysql mysql -uroot -p -e "\
+DROP FUNCTION IF EXISTS AEAD_ENCRYPT_DEFAULT; \
+DROP FUNCTION IF EXISTS AEAD_DECRYPT_DEFAULT; \
+DROP FUNCTION IF EXISTS HMAC_SHA256_DEFAULT; \
+CREATE FUNCTION AEAD_ENCRYPT_DEFAULT RETURNS STRING SONAME 'aead.so'; \
+CREATE FUNCTION AEAD_DECRYPT_DEFAULT RETURNS STRING SONAME 'aead.so'; \
+CREATE FUNCTION HMAC_SHA256_DEFAULT  RETURNS STRING SONAME 'aead.so'; \
+"
+
+# verifikasi terdaftar
+docker exec -it mysql mysql -uroot -p -e "SELECT * FROM mysql.func\G"
+
+
+# HOST: pastikan agent aktif dan socket ada
+sudo pkill -f sgx-agent || true
+sudo env LD_LIBRARY_PATH="/home/admin-vb/opt/intel/sgxsdk/sdk_libs:/home/admin-vb/opt/intel/sgxsdk/lib64" \
+     ~/sgx-aead-agent/build/host/sgx-agent &
+sleep 1
+ls -l /run/aead-kms.sock   # harus ada
+
+# CONTAINER: soket termount ke /hostrun
+docker exec -it mysql ls -l /hostrun/aead-kms.sock
+docker exec -it mysql env | egrep 'AEAD_KMS'
+# Harus: AEAD_KMS_MODE=AGENT  dan  AEAD_KMS_SOCK=/hostrun/aead-kms.sock
+
+
+docker exec -it mysql bash -lc "cat >/etc/aead_keys.json <<'J' 
+{\"1\":\"6f2e5a4b0a1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c\"}
+J
+"
+
+
+docker exec -it mysql mysql -uroot -p -D oai_db -e "\
+SELECT LENGTH(AEAD_ENCRYPT_DEFAULT(_binary'hello',_binary'aad',1)) AS enc_len; \
+SELECT AEAD_DECRYPT_DEFAULT(AEAD_ENCRYPT_DEFAULT(_binary'hello',_binary'aad',1),_binary'aad',1) AS plain; \
+SELECT HEX(HMAC_SHA256_DEFAULT(_binary'hello',1)) AS tok; \
+"
+
+docker exec -it mysql bash -lc "ldd /usr/lib64/mysql/plugin/aead.so"
+# kalau ada “not found” untuk libssl / libcrypto → install paket openssl-libs di image EL9
+
+
+#cek socket
+ss -xlp | grep aead-kms.sock
+
+sudo mkdir -p /var/lib/sgx-agent
+sudo chown root:root /var/lib/sgx-agent
+sudo chmod 700 /var/lib/sgx-agent
+
+
+
+
+docker exec -it mysql id -g mysql
+999
+
+sudo chown root:<GID_DARI_LANGKAH_1> /run/aead-kms.sock
+sudo chmod 660 /run/aead-kms.sock
+ls -l /run/aead-kms.sock
+# harus: srw-rw---- 1 root <gid_tsb> ... /run/aead-kms.sock
+
+sudo chown root:999 /run/aead-kms.sock
+sudo chmod 660 /run/aead-kms.sock
+ls -l /run/aead-kms.sock
+# harus: srw-rw---- 1 root <gid_tsb> ... /run/aead-kms.sock
+
+
+docker exec -it mysql ls -ln /hostrun/aead-kms.sock
+# harus: srw-rw---- 1 0 <gid_tsb> ... /hostrun/aead-kms.sock
+
+
+
+
+
+
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant M as mysqld
+  participant U as UDF
+  participant F as keys.json
+  participant A as sgx-agent
+  participant E as Enclave AES-GCM
+
+  C->>M: SELECT AEAD_ENCRYPT_DEFAULT(plain,aad,kid)
+  M->>U: call UDF
+
+  alt KMS=FILE
+    U->>F: load key(kid)
+    F-->>U: key
+    U->>U: AES-GCM encrypt (nonce,ct,tag)
+    U-->>M: blob
+  else KMS=AGENT
+    U->>A: ENC(kid,plain,aad)
+    A->>E: ECALL enc
+    E-->>A: blob
+    A-->>U: blob
+    U-->>M: blob
+  end
+
+  M-->>C: blob (nonce||ct||tag)
+
+
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant M as mysqld
+  participant U as UDF
+  participant F as keys.json
+  participant A as sgx-agent
+  participant E as Enclave AES-GCM
+
+  C->>M: SELECT AEAD_DECRYPT_DEFAULT(blob,aad,kid)
+  M->>U: call UDF
+
+  alt KMS=FILE
+    U->>F: load key(kid)
+    F-->>U: key
+    U->>U: AES-GCM decrypt+verify
+    U-->>M: plaintext or NULL
+  else KMS=AGENT
+    U->>A: DEC(kid,blob,aad)
+    A->>E: ECALL dec
+    E-->>A: plaintext or error
+    A-->>U: plaintext or error
+    U-->>M: plaintext or NULL
+  end
+
+  M-->>C: plaintext (e.g. 0x68656C6C6F)
+
+

@@ -1,0 +1,303 @@
+ALTER TABLE `AuthenticationSubscription`
+  MODIFY `UEID` VARCHAR(255) NOT NULL,
+  MODIFY `SUPI` VARCHAR(255) NULL,
+  MODIFY `encPermanentKey` VARCHAR(255) NULL;
+
+CREATE INDEX `idx_authsubscription_ueid` ON `AuthenticationSubscription` (`UEID`);
+
+DROP TRIGGER IF EXISTS `AuthenticationSubscription_bi`;
+DELIMITER //
+
+CREATE TRIGGER `AuthenticationSubscription_bi`
+BEFORE INSERT ON `AuthenticationSubscription`
+FOR EACH ROW
+BEGIN
+  -- === UEID: simpan SHA1 sebagai 40-hex lowercase ===
+  IF NEW.`UEID` IS NOT NULL THEN
+    -- Jika sudah 40-hex, normalisasi ke lowercase
+    IF CHAR_LENGTH(NEW.`UEID`) = 40
+       AND NEW.`UEID` REGEXP '^[0-9A-Fa-f]{40}$' THEN
+      SET NEW.`UEID` = LOWER(NEW.`UEID`);
+    -- Jika 20-byte biner (jarang terjadi untuk VARCHAR), ubah ke hex
+    ELSEIF OCTET_LENGTH(NEW.`UEID`) = 20 THEN
+      SET NEW.`UEID` = LOWER(HEX(NEW.`UEID`));
+    -- Selain itu, hash ke SHA1 (hasilnya 40-hex)
+    ELSE
+      SET NEW.`UEID` = LOWER(SHA1(NEW.`UEID`));
+    END IF;
+  END IF;
+
+  -- === SUPI: AEAD -> Base64 simpan ke VARCHAR ===
+  IF NEW.`SUPI` IS NOT NULL THEN
+    SET NEW.`SUPI` = TO_BASE64(
+      AEAD_ENCRYPT_DEFAULT(
+        CAST(NEW.`SUPI` AS BINARY),
+        CAST('tbl=AuthenticationSubscription;col=SUPI;v=1' AS BINARY),
+        1
+      )
+    );
+  END IF;
+
+  -- === encPermanentKey: AEAD -> Base64 simpan ke VARCHAR ===
+  IF NEW.`encPermanentKey` IS NOT NULL THEN
+    SET NEW.`encPermanentKey` = TO_BASE64(
+      AEAD_ENCRYPT_DEFAULT(
+        CAST(NEW.`encPermanentKey` AS BINARY),
+        CAST('tbl=AuthenticationSubscription;col=encPermanentKey;v=1' AS BINARY),
+        1
+      )
+    );
+  END IF;
+END//
+DELIMITER ;
+
+DROP TRIGGER IF EXISTS `AuthenticationSubscription_bu`;
+DELIMITER //
+
+CREATE TRIGGER `AuthenticationSubscription_bu`
+BEFORE UPDATE ON `AuthenticationSubscription`
+FOR EACH ROW
+BEGIN
+  -- === UEID: proses hanya jika berubah ===
+  IF NEW.`UEID` IS NOT NULL AND (OLD.`UEID` IS NULL OR NEW.`UEID` <> OLD.`UEID`) THEN
+    IF CHAR_LENGTH(NEW.`UEID`) = 40
+       AND NEW.`UEID` REGEXP '^[0-9A-Fa-f]{40}$' THEN
+      SET NEW.`UEID` = LOWER(NEW.`UEID`);
+    ELSEIF OCTET_LENGTH(NEW.`UEID`) = 20 THEN
+      SET NEW.`UEID` = LOWER(HEX(NEW.`UEID`));
+    ELSE
+      SET NEW.`UEID` = LOWER(SHA1(NEW.`UEID`));
+    END IF;
+  END IF;
+
+  -- === SUPI: AEAD -> Base64 bila berubah ===
+  IF NEW.`SUPI` IS NOT NULL AND (OLD.`SUPI` IS NULL OR NEW.`SUPI` <> OLD.`SUPI`) THEN
+    SET NEW.`SUPI` = TO_BASE64(
+      AEAD_ENCRYPT_DEFAULT(
+        CAST(NEW.`SUPI` AS BINARY),
+        CAST('tbl=AuthenticationSubscription;col=SUPI;v=1' AS BINARY),
+        1
+      )
+    );
+  END IF;
+
+  -- === encPermanentKey: AEAD -> Base64 bila berubah ===
+  IF NEW.`encPermanentKey` IS NOT NULL
+     AND (OLD.`encPermanentKey` IS NULL OR NEW.`encPermanentKey` <> OLD.`encPermanentKey`) THEN
+    SET NEW.`encPermanentKey` = TO_BASE64(
+      AEAD_ENCRYPT_DEFAULT(
+        CAST(NEW.`encPermanentKey` AS BINARY),
+        CAST('tbl=AuthenticationSubscription;col=encPermanentKey;v=1' AS BINARY),
+        1
+      )
+    );
+  END IF;
+END//
+DELIMITER ;
+
+
+
+
+# pilih folder kerja
+sudo mkdir -p ~/sgx && cd ~/sgx
+
+# unduh installer SDK (contoh untuk Ubuntu 22.04/24.04, sesuaikan kalau perlu)
+wget https://download.01.org/intel-sgx/sgx-linux/2.19/distro/ubuntu22.04-server/sgx_linux_x64_sdk_2.19.100.3.bin
+
+chmod +x sgx_linux_x64_sdk_*.bin
+./sgx_linux_x64_sdk_*.bin --prefix /opt/intel
+
+
+
+cd ~/sgx-aead-agent/build
+rm -rf enclave/edger8r host/edger8r CMakeCache.txt CMakeFiles
+source "$HOME/opt/intel/sgxsdk/environment"
+cmake -DSGX_SDK="$SGX_SDK" -DSGX_MODE=SIM ..
+make -j
+
+
+
+# salin ke plugin dir
+docker cp ~/aead.so mysql:/usr/lib64/mysql/plugin/aead.so
+
+# drop & recreate supaya MySQL reload .so terbaru
+docker exec -it mysql mysql -uroot -p -e "\
+DROP FUNCTION IF EXISTS AEAD_ENCRYPT_DEFAULT; \
+DROP FUNCTION IF EXISTS AEAD_DECRYPT_DEFAULT; \
+DROP FUNCTION IF EXISTS HMAC_SHA256_DEFAULT; \
+CREATE FUNCTION AEAD_ENCRYPT_DEFAULT RETURNS STRING SONAME 'aead.so'; \
+CREATE FUNCTION AEAD_DECRYPT_DEFAULT RETURNS STRING SONAME 'aead.so'; \
+CREATE FUNCTION HMAC_SHA256_DEFAULT  RETURNS STRING SONAME 'aead.so'; \
+"
+
+# verifikasi terdaftar
+docker exec -it mysql mysql -uroot -p -e "SELECT * FROM mysql.func\G"
+
+
+# 1) jalankan agent dengan argumen path socket di /tmp
+SOCK=/tmp/aead-kms.sock
+[ -S "$SOCK" ] && rm -f "$SOCK"
+KMS_SOCK_PATH="$SOCK" ./host/sgx-agent ./host/Enclave.signed.so
+# (lihat catatan "patch kecil" di bawah—kalau belum patch, gunakan Opsi 2/3)
+
+
+sudo chown admin-vb:999 /run/aead-kms
+sudo chmod 770 /run/aead-kms
+ls -ld /run/aead-kms   # pastikan owner=admin-vb, group=999, perms drwxrwx---
+
+KMS_SOCK_PATH=/run/aead-kms/aead-kms.sock \
+  ~/sgx-aead-agent/build/host/sgx-agent \
+  ~/sgx-aead-agent/build/host/Enclave.signed.so
+
+
+
+docker exec -it mysql id -g mysql
+
+sudo chgrp 999 /run/aead-kms/aead-kms.sock
+sudo chmod 660 /run/aead-kms/aead-kms.sock
+ls -ln /run/aead-kms/aead-kms.sock   # harus srw-rw---- 1 <uid> 999 ...
+
+
+docker exec -it mysql ls -ln /hostrun/aead-kms/aead-kms.sock
+
+docker exec -it mysql python3 - <<'PY'
+import socket
+s=socket.socket(socket.AF_UNIX); s.connect("/hostrun/aead-kms/aead-kms.sock")
+print("connect OK"); s.close()
+PY
+
+
+docker exec -it mysql mysql -uroot -p -D oai_db -e "\
+SELECT LENGTH(AEAD_ENCRYPT_DEFAULT(_binary'hello',_binary'aad',1)) AS enc_len; \
+SELECT AEAD_DECRYPT_DEFAULT(AEAD_ENCRYPT_DEFAULT(_binary'hello',_binary'aad',1),_binary'aad',1) AS plain; \
+SELECT HEX(HMAC_SHA256_DEFAULT(_binary'hello',1)) AS tok; \
+"
+
+
+docker exec -it mysql mysql -uroot -p -D oai_db -e "\
+SHOW FUNCTION STATUS WHERE Db = DATABASE() AND Name LIKE 'HMAC%'; \
+SELECT ROUTINE_NAME, DTD_IDENTIFIER \
+FROM INFORMATION_SCHEMA.ROUTINES \
+WHERE ROUTINE_TYPE='FUNCTION' AND ROUTINE_SCHEMA=DATABASE() AND ROUTINE_NAME LIKE 'HMAC%'; \
+"
+
+
+
+MYSQL_PASS=linux MODE=enc COUNT=1000 ./bench_subscriber.sh
+
+DURATION=30 SAMPLE_INTERVAL=1 MODE_TAG=probe CTR_NAME=mysql ./monitor_resources.sh
+tail -n +5 monitor_report.csv
+
+
+
+
+
+DURATION=60 SAMPLE_INTERVAL=1 MODE_TAG=probe CTR_NAME=mysql ./monitor_resources.sh
+tail -n +5 i_plain_monitor_resources.csv
+
+
+DURATION=60 SAMPLE_INTERVAL=1 MODE_TAG=probe CTR_NAME=mysql ./monitor_resources.sh
+tail -n +5 enc_monitor_resources.csv
+
+DURATION=60 SAMPLE_INTERVAL=1 MODE_TAG=probe CTR_NAME=mysql ./monitor_resources.sh
+tail -n +5 s_plain_monitor_resources.csv
+
+DURATION=60 SAMPLE_INTERVAL=1 MODE_TAG=probe CTR_NAME=mysql ./monitor_resources.sh
+tail -n +5 dec_monitor_resources.csv
+
+
+MYSQL_PASS=linux MODE=plain COUNT=10000 ./bench_subscriber.sh
+MYSQL_PASS=linux MODE=enc COUNT=10000 ./bench_subscriber.sh
+MYSQL_PASS=linux COUNT=10000 MODE=plain ./bench_subscriber2.sh
+MYSQL_PASS=linux COUNT=10000 MODE=dec ./bench_subscriber2.sh
+
+
+SELECT ueid, supi ,authenticationMethod,encPermanentKey,protectionParameterId,sequenceNumber,authenticationManagementField,algorithmId,encOpcKey,encTopcKey,
+vectorGenerationInHss, n5gcAuthMethod, rgAuthenticationInd
+FROM `AuthenticationSubscription`
+WHERE SHA1(ueid) = d6f704779f5c5077fca92ee916771f8e;
+
+
+SELECT ueid, supi ,authenticationMethod,encPermanentKey,protectionParameterId,sequenceNumber,authenticationManagementField,algorithmId,encOpcKey,encTopcKey,
+vectorGenerationInHss, n5gcAuthMethod, rgAuthenticationInd
+FROM `AuthenticationSubscription`
+WHERE ueid = 001010000000001;
+
+
+#OriginWay
+CPU Average: 27.3%
+CPU Maximum: 33.9%
+CPU Minimum: 1.4%
+CPU Percentile: 33.4%
+Memori Average: 2.61% from limit (≈ 418 MB from 15.6 GB)
+
+#Encryption
+CPU Average: 30.0%
+CPU Maximum: 37.0%
+CPU Minimum: 1.8%
+CPU Percentile: 36.6%
+Memori Average: 2.62% from limit (≈ 438 MB from 15.6 GB)
+
+
+#OriginWay
+CPU Average: 5.00%
+CPU Maximum: 7.07%
+CPU Minimum: 0.91%
+CPU Percentile: 6.91%
+Memori Average: 2.615% dari limit (≈ 418 MB dari 15.6 GB)
+
+#Decryption
+CPU Average: 16.23%
+CPU Maximum: 25.05%
+CPU Minimum: 1.58%
+CPU Percentile: 22.90%
+Memori Average: 2.619% dari limit (≈ 2.62% * 15.62 GiB ≈ 0.41 GiB)
+
+
+cd ~/src/oai-cn5g-udr
+# contoh tag: adi/oai-udr:dev
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.udr.ubuntu \
+  -t adi/oai-udr:dev .
+
+docker build --no-cache --progress=plain -t adi/oai-udr:dev -f docker/Dockerfile.udr.ubuntu .
+
+
+
+001010000000001 a18c9fbcbb6b2f74559836d522c69a840545c1c4
+001010000000002 0ed1eadb80c57745d2d39107d004cd07c0149a0c
+001010000000003 d8439547ee45ef71ede3c039b9d932372740ad21
+001010000000004 ba078e7009115e56d54f4df31a455c7572878383
+
+
+
+
+CREATE TABLE sub_plain (
+  ueid VARCHAR(255) PRIMARY KEY,
+  authenticationMethod VARCHAR(25) NOT NULL,
+  encPermanentKey VARCHAR(255) NULL,
+  protectionParameterId VARCHAR(50) NULL,
+  sequenceNumber JSON NULL,
+  authenticationManagementField VARCHAR(50) NULL,
+  algorithmId VARCHAR(50) NULL,
+  encOpcKey VARCHAR(255) NULL,
+  encTopcKey VARCHAR(255) NULL,
+  vectorGenerationInHss TINYINT(1) NULL,
+  n5gcAuthMethod VARCHAR(15) NULL,
+  rgAuthenticationInd TINYINT(1) NULL,
+  supi VARCHAR(20) NULL
+) ENGINE=InnoDB;
+
+
+CREATE TABLE sub_aead LIKE sub_plain;
+
+
+
+timestamp,container,cpu_percent,mem_usage,mem_limit,mem_percent,net_io,block_io,pids
+
+
+MYSQL_PASS=linux SAMPLE_INTERVAL=1 COUNT=1000 MODE=plain bash bench_insert.sh
+MYSQL_PASS=linux SAMPLE_INTERVAL=1 COUNT=1000 MODE=enc bash bench_insert.sh
+
+MYSQL_PASS=linux MODE=plain LIMIT_ROWS=1000 SAMPLE_INTERVAL=1 bash bench_select.sh
+MYSQL_PASS=linux MODE=dec LIMIT_ROWS=1000 SAMPLE_INTERVAL=1 bash bench_select.sh
